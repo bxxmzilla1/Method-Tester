@@ -1,5 +1,5 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node";
-import geoip from "geoip-lite";
+import { countryFromProxiedRequest } from "../lib/country-from-request";
 import { getSupabaseServer } from "../lib/supabase-server";
 import { renderLinkLandingHtml } from "../lib/link-service";
 
@@ -38,8 +38,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     if (Array.isArray(ip)) ip = ip[0];
     ip = String(ip).split(",")[0].trim();
 
-    const geo = geoip.lookup(ip);
-    const country = geo ? geo.country : "Unknown";
+    const country = countryFromProxiedRequest(req) || "Unknown";
 
     const { error: visitErr } = await supabase.from("visits").insert({
       link_slug: slug,

@@ -3,6 +3,7 @@ import express from "express";
 import { createServer as createViteServer } from "vite";
 import path from "node:path";
 import geoip from "geoip-lite";
+import { countryFromProxiedRequest } from "./lib/country-from-request";
 import { getSupabaseServer } from "./lib/supabase-server";
 import {
   buildLinksPayload,
@@ -121,8 +122,8 @@ export async function startServer() {
         if (Array.isArray(ip)) ip = ip[0];
         ip = (ip as string).split(",")[0].trim();
 
-        const geo = geoip.lookup(ip);
-        const country = geo ? geo.country : "Unknown";
+        const fromHeader = countryFromProxiedRequest(req);
+        const country = fromHeader || (geoip.lookup(ip)?.country ?? "Unknown");
 
         const { error: visitErr } = await supabase.from("visits").insert({
           link_slug: slug,
