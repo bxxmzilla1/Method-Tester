@@ -8,7 +8,8 @@ import {
   Image as ImageIcon, 
   Link as LinkIcon, 
   Copy, 
-  Check
+  Check, 
+  ArrowRight
 } from 'lucide-react';
 import { formatDistanceToNow } from 'date-fns';
 
@@ -21,9 +22,7 @@ interface LinkStat {
   id: string;
   slug: string;
   bio: string;
-  screenshot_path: string | null;
-  /** Image bytes stored in DB (Turso / remote). */
-  screenshot_inline?: boolean;
+  screenshot_path: string;
   created_at: string;
   total_clicks: number;
   unique_clicks: number;
@@ -49,22 +48,45 @@ function linkOrigin(): string {
 }
 
 function mediaSrc(screenshotPath: string): string {
+  if (!screenshotPath) return '';
+  if (/^https?:\/\//i.test(screenshotPath)) return screenshotPath;
   const p = screenshotPath.startsWith('/')
     ? screenshotPath
     : `/${screenshotPath}`;
   return `${API_BASE}${p}`;
 }
 
-function screenshotSrc(link: LinkStat): string | undefined {
-  if (link.screenshot_inline) {
-    return apiPath(
-      `/api/links/${encodeURIComponent(link.slug)}/screenshot`,
-    );
+async function fileToBase64Payload(
+  file: File,
+): Promise<{ screenshotBase64: string; screenshotMime: string }> {
+  return new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => {
+      const s = r.result as string;
+      const i = s.indexOf(',');
+      const b64 = i >= 0 ? s.slice(i + 1) : s;
+      resolve({
+        screenshotBase64: b64,
+        screenshotMime: file.type || 'image/png',
+      });
+    };
+    r.onerror = () => reject(new Error('Could not read file'));
+    r.readAsDataURL(file);
+  });
+}
+
+async function readErrorMessage(res: Response): Promise<string> {
+  const ct = res.headers.get('content-type') ?? '';
+  try {
+    if (ct.includes('application/json')) {
+      const data = (await res.json()) as { error?: string };
+      return data.error ?? `Request failed (${res.status})`;
+    }
+    const text = (await res.text()).trim();
+    return text ? text.slice(0, 240) : `Request failed (${res.status})`;
+  } catch {
+    return `Request failed (${res.status})`;
   }
-  if (link.screenshot_path) {
-    return mediaSrc(link.screenshot_path);
-  }
-  return undefined;
 }
 
 export default function App() {
@@ -110,15 +132,19 @@ export default function App() {
     if (!slug) return alert("Slug is required");
 
     setSubmitting(true);
-    const formData = new FormData();
-    formData.append('slug', slug);
-    if (bio) formData.append('bio', bio);
-    if (file) formData.append('screenshot', file);
 
     try {
+      const payload: Record<string, string> = { slug, bio: bio || '' };
+      if (file) {
+        const shot = await fileToBase64Payload(file);
+        payload.screenshotBase64 = shot.screenshotBase64;
+        payload.screenshotMime = shot.screenshotMime;
+      }
+
       const res = await fetch(apiPath('/api/links'), {
         method: 'POST',
-        body: formData,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
       });
 
       if (res.ok) {
@@ -129,12 +155,15 @@ export default function App() {
         if (fileInputRef.current) fileInputRef.current.value = '';
         await fetchLinks();
       } else {
-        const data = await res.json();
-        alert(data.error || "Failed to create link");
+        alert(await readErrorMessage(res));
       }
     } catch (err) {
       console.error(err);
-      alert("Network error");
+      alert(
+        err instanceof Error && err.message
+          ? err.message
+          : 'Network error — check that /api/links works and env vars are set on Vercel.',
+      );
     } finally {
       setSubmitting(false);
     }
@@ -261,9 +290,9 @@ export default function App() {
                 links.map((link) => (
                   <div key={link.id} className="bg-white rounded-2xl shadow-sm border border-zinc-200 overflow-hidden flex flex-col sm:flex-row">
                      {/* Thumbnail side */}
-                     {screenshotSrc(link) ? (
+                     {link.screenshot_path ? (
                        <div className="w-full sm:w-48 h-48 sm:h-auto bg-zinc-100 flex-shrink-0 relative border-b sm:border-b-0 sm:border-r border-zinc-200">
-                          <img src={screenshotSrc(link)} alt="Thumbnail" className="w-full h-full object-cover absolute inset-0" />
+                          <img src={mediaSrc(link.screenshot_path)} alt="Thumbnail" className="w-full h-full object-cover absolute inset-0" />
                        </div>
                      ) : (
                        <div className="w-full sm:w-48 h-32 sm:h-auto bg-zinc-50 flex flex-col items-center justify-center flex-shrink-0 border-b sm:border-b-0 sm:border-r border-zinc-200 text-zinc-400">

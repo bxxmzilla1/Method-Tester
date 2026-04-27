@@ -1,55 +1,41 @@
-import "dotenv/config";
+import { config } from "dotenv";
 import express from "express";
 import { createServer as createViteServer } from "vite";
-import fs from "node:fs";
 import path from "node:path";
-import multer from "multer";
 import geoip from "geoip-lite";
-import crypto from "node:crypto";
+import { getSupabaseServer } from "./lib/supabase-server";
 import {
-  createDbClient,
-  runMigrations,
-  isRemoteDatabase,
-  insertLink,
-  listLinksWithAnalytics,
-  getLinkBySlug,
-  insertVisit,
-  isUniqueConstraintError,
-} from "./server/db.js";
+  buildLinksPayload,
+  createLink,
+  renderLinkLandingHtml,
+  type UploadedFile,
+} from "./lib/link-service";
 
-function escapeHtml(text: string): string {
-  return text
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
+config({ path: ".env" });
+config({ path: ".env.local", override: true });
+
+let supabase: ReturnType<typeof getSupabaseServer>;
+try {
+  supabase = getSupabaseServer();
+} catch (e) {
+  console.error(
+    "Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY (see .env.example and supabase/migrations/001_initial.sql).",
+  );
+  console.error(e);
+  process.exit(1);
 }
 
-const UPLOADS_DIR = path.join(process.cwd(), "uploads");
-if (!fs.existsSync(UPLOADS_DIR)) {
-  fs.mkdirSync(UPLOADS_DIR, { recursive: true });
+function sendCreateLinkError(res: express.Response, err: unknown) {
+  const e = err as { statusCode?: number; message?: string };
+  const status = typeof e.statusCode === "number" ? e.statusCode : 500;
+  const body =
+    status === 500
+      ? { error: "Internal server error" }
+      : { error: e.message || "Bad request" };
+  res.status(status).json(body);
 }
-
-const useRemoteDb = isRemoteDatabase();
-
-const upload = multer({
-  storage: useRemoteDb
-    ? multer.memoryStorage()
-    : multer.diskStorage({
-        destination: (_req, _file, cb) => cb(null, UPLOADS_DIR),
-        filename: (_req, file, cb) => {
-          const uniqueSuffix = Date.now() + "-" + Math.round(Math.random() * 1e9);
-          const ext = path.extname(file.originalname);
-          cb(null, file.fieldname + "-" + uniqueSuffix + ext);
-        },
-      }),
-  limits: { fileSize: 5 * 1024 * 1024 },
-});
 
 export async function startServer() {
-  const db = createDbClient();
-  await runMigrations(db);
-
   const app = express();
   const PORT = 3000;
 
@@ -66,90 +52,42 @@ export async function startServer() {
     });
   }
 
-  app.use(express.json());
-  app.use("/uploads", express.static(UPLOADS_DIR));
+  app.use(express.json({ limit: "6mb" }));
 
-  app.post("/api/links", upload.single("screenshot"), async (req, res) => {
+  app.post("/api/links", async (req, res) => {
     try {
-      const { slug, bio } = req.body;
-      if (!slug) {
-        return res.status(400).json({ error: "Slug is required" });
+      const b = req.body as {
+        slug?: string;
+        bio?: string;
+        screenshotBase64?: string;
+        screenshotMime?: string;
+      };
+      let file: UploadedFile | null = null;
+      if (b.screenshotBase64) {
+        file = {
+          buffer: Buffer.from(b.screenshotBase64, "base64"),
+          mimetype: b.screenshotMime || "image/png",
+          originalname: "upload.png",
+        };
       }
-
-      let screenshot_path: string | null = null;
-      let screenshot_mime: string | null = null;
-      let screenshot_base64: string | null = null;
-
-      if (req.file) {
-        if (useRemoteDb) {
-          screenshot_mime = req.file.mimetype || "application/octet-stream";
-          screenshot_base64 = req.file.buffer.toString("base64");
-        } else {
-          screenshot_path = `uploads/${req.file.filename}`;
-        }
-      }
-
-      const id = crypto.randomUUID();
-      await insertLink(db, {
-        id,
-        slug,
-        bio: bio || "",
-        screenshot_path,
-        screenshot_mime,
-        screenshot_base64,
+      const data = await createLink(supabase, {
+        slug: b.slug ?? "",
+        bio: b.bio ?? "",
+        file,
       });
-
-      res.status(201).json({
-        id,
-        slug,
-        bio: bio || "",
-        screenshot_path,
-        screenshot_inline: !!screenshot_base64,
-      });
-    } catch (err: unknown) {
-      if (isUniqueConstraintError(err)) {
-        return res.status(400).json({ error: "Slug already exists" });
-      }
-      console.error(err);
-      res.status(500).json({ error: "Internal server error" });
+      res.status(201).json(data);
+    } catch (err) {
+      sendCreateLinkError(res, err);
     }
   });
 
-  app.get("/api/links", async (_req, res) => {
+  app.get("/api/links", async (req, res) => {
     try {
-      const links = await listLinksWithAnalytics(db);
-      res.json(
-        links.map((l) => ({
-          id: l.id,
-          slug: l.slug,
-          bio: l.bio ?? "",
-          screenshot_path: l.screenshot_path,
-          screenshot_inline: !!l.screenshot_base64,
-          created_at: l.created_at,
-          total_clicks: l.total_clicks,
-          unique_clicks: l.unique_clicks,
-          countries: l.countries,
-        })),
-      );
+      const payload = await buildLinksPayload(supabase);
+      res.json(payload);
     } catch (error) {
       console.error(error);
       res.status(500).json({ error: "Internal server error" });
-    }
-  });
-
-  app.get("/api/links/:slug/screenshot", async (req, res) => {
-    try {
-      const link = await getLinkBySlug(db, req.params.slug);
-      if (!link?.screenshot_base64 || !link.screenshot_mime) {
-        return res.status(404).end();
-      }
-      const buf = Buffer.from(link.screenshot_base64, "base64");
-      res.setHeader("Content-Type", link.screenshot_mime);
-      res.setHeader("Cache-Control", "public, max-age=86400");
-      res.send(buf);
-    } catch (e) {
-      console.error(e);
-      res.status(500).end();
     }
   });
 
@@ -167,7 +105,16 @@ export async function startServer() {
     }
 
     try {
-      const link = await getLinkBySlug(db, slug);
+      const { data: link, error } = await supabase
+        .from("links")
+        .select("*")
+        .eq("slug", slug)
+        .maybeSingle();
+
+      if (error) {
+        console.error(error);
+        return next();
+      }
 
       if (link) {
         let ip = req.headers["x-forwarded-for"] || req.socket.remoteAddress || "127.0.0.1";
@@ -177,43 +124,22 @@ export async function startServer() {
         const geo = geoip.lookup(ip);
         const country = geo ? geo.country : "Unknown";
 
-        await insertVisit(db, slug, ip, country);
+        const { error: visitErr } = await supabase.from("visits").insert({
+          link_slug: slug,
+          ip_address: ip,
+          country,
+        });
 
-        const imgSrc = link.screenshot_base64
-          ? `/api/links/${encodeURIComponent(link.slug)}/screenshot`
-          : link.screenshot_path
-            ? `/${link.screenshot_path}`
-            : null;
+        if (visitErr) {
+          console.error(visitErr);
+        }
 
-        const bioHtml = link.bio
-          ? `<p style="font-size: 1.1rem; color: #3f3f46; margin-bottom: 24px;">${escapeHtml(link.bio)}</p>`
-          : "";
-
-        const imgHtml = imgSrc
-          ? `<img src="${imgSrc}" alt="Screenshot for ${escapeHtml(link.slug)}" />`
-          : "<p>No screenshot available.</p>";
-
-        res.send(`<!DOCTYPE html>
-<html>
-<head>
-  <title>View Link</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <style>
-    body { font-family: system-ui, sans-serif; background: #f4f4f5; display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 100vh; margin: 0; padding: 20px; box-sizing: border-box; }
-    .card { background: white; padding: 24px; border-radius: 12px; box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.1); max-width: 800px; width: 100%; text-align: center; }
-    img { max-width: 100%; height: auto; border-radius: 8px; margin-top: 16px; margin-bottom: 24px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
-  </style>
-</head>
-<body>
-  <div class="card">
-    ${bioHtml}
-    ${imgHtml}
-  </div>
-</body>
-</html>`);
-      } else {
-        next();
+        res.setHeader("Content-Type", "text/html; charset=utf-8");
+        res.send(renderLinkLandingHtml(link));
+        return;
       }
+
+      next();
     } catch (e) {
       console.error(e);
       next();
@@ -236,11 +162,6 @@ export async function startServer() {
 
   app.listen(PORT, "0.0.0.0", () => {
     console.log(`Server running on http://localhost:${PORT}`);
-    console.log(
-      useRemoteDb
-        ? "Database: Turso (remote)"
-        : "Database: local links.db file",
-    );
   });
 }
 

@@ -51,6 +51,12 @@ export default defineConfig(({mode}) => {
         workbox: {
           globPatterns: ['**/*.{js,css,html,ico,png,svg,woff2,webp}'],
           navigateFallbackDenylist: [/^\/api/, /^\/uploads/],
+          runtimeCaching: [
+            {
+              urlPattern: ({url}) => url.pathname.startsWith('/api'),
+              handler: 'NetworkOnly',
+            },
+          ],
         },
         devOptions: {
           enabled: false,
