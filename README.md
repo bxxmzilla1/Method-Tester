@@ -16,6 +16,17 @@ View your app in AI Studio: https://ai.studio/apps/781876a0-5c93-4d0a-849e-6e96a
 2. Copy [.env.example](.env.example) to `.env` or `.env.local` and set variables as needed.
 3. Run the app: `npm run dev` (Express + Vite middleware on port 3000)
 
+### Database
+
+The API stores **links** (slug, bio), **visit analytics** (IP, country, timestamps), and optionally **screenshots** using [LibSQL](https://github.com/tursodatabase/libsql) via [`@libsql/client`](https://github.com/tursodatabase/libsql-client-ts).
+
+| Mode | Configuration | Data |
+|------|---------------|------|
+| **Local (default)** | No `TURSO_*` env vars | `links.db` on disk; screenshot files in `uploads/` |
+| **Turso Cloud** | `TURSO_DATABASE_URL` + `TURSO_AUTH_TOKEN` | Same rows in a remote database; screenshots stored as base64 in the `links` table |
+
+Create a free database at [Turso](https://turso.tech/), then run `turso db tokens create <db-name>` (or use the dashboard) and copy the URL and token into `.env`. Restart the server after changing env vars.
+
 ### PWA
 
 The Vite build includes a web app manifest and service worker (`vite-plugin-pwa`). After `npm run build`, install prompts appear on supported browsers when the site is served over HTTPS.

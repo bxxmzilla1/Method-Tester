@@ -8,8 +8,7 @@ import {
   Image as ImageIcon, 
   Link as LinkIcon, 
   Copy, 
-  Check, 
-  ArrowRight
+  Check
 } from 'lucide-react';
 import { formatDistanceToNow } from 'date-fns';
 
@@ -22,7 +21,9 @@ interface LinkStat {
   id: string;
   slug: string;
   bio: string;
-  screenshot_path: string;
+  screenshot_path: string | null;
+  /** Image bytes stored in DB (Turso / remote). */
+  screenshot_inline?: boolean;
   created_at: string;
   total_clicks: number;
   unique_clicks: number;
@@ -52,6 +53,18 @@ function mediaSrc(screenshotPath: string): string {
     ? screenshotPath
     : `/${screenshotPath}`;
   return `${API_BASE}${p}`;
+}
+
+function screenshotSrc(link: LinkStat): string | undefined {
+  if (link.screenshot_inline) {
+    return apiPath(
+      `/api/links/${encodeURIComponent(link.slug)}/screenshot`,
+    );
+  }
+  if (link.screenshot_path) {
+    return mediaSrc(link.screenshot_path);
+  }
+  return undefined;
 }
 
 export default function App() {
@@ -248,9 +261,9 @@ export default function App() {
                 links.map((link) => (
                   <div key={link.id} className="bg-white rounded-2xl shadow-sm border border-zinc-200 overflow-hidden flex flex-col sm:flex-row">
                      {/* Thumbnail side */}
-                     {link.screenshot_path ? (
+                     {screenshotSrc(link) ? (
                        <div className="w-full sm:w-48 h-48 sm:h-auto bg-zinc-100 flex-shrink-0 relative border-b sm:border-b-0 sm:border-r border-zinc-200">
-                          <img src={mediaSrc(link.screenshot_path)} alt="Thumbnail" className="w-full h-full object-cover absolute inset-0" />
+                          <img src={screenshotSrc(link)} alt="Thumbnail" className="w-full h-full object-cover absolute inset-0" />
                        </div>
                      ) : (
                        <div className="w-full sm:w-48 h-32 sm:h-auto bg-zinc-50 flex flex-col items-center justify-center flex-shrink-0 border-b sm:border-b-0 sm:border-r border-zinc-200 text-zinc-400">

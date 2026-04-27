@@ -1,35 +1,28 @@
+import "dotenv/config";
 import express from "express";
 import { createServer as createViteServer } from "vite";
 import fs from "node:fs";
 import path from "node:path";
 import multer from "multer";
-import { DatabaseSync } from "node:sqlite";
 import geoip from "geoip-lite";
 import crypto from "node:crypto";
+import {
+  createDbClient,
+  runMigrations,
+  isRemoteDatabase,
+  insertLink,
+  listLinksWithAnalytics,
+  getLinkBySlug,
+  insertVisit,
+  isUniqueConstraintError,
+} from "./server/db.js";
 
-const database = new DatabaseSync("links.db");
-
-database.exec(`
-  CREATE TABLE IF NOT EXISTS links (
-    id TEXT PRIMARY KEY,
-    slug TEXT UNIQUE,
-    target_url TEXT,
-    screenshot_path TEXT,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  );
-  CREATE TABLE IF NOT EXISTS visits (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    link_slug TEXT,
-    ip_address TEXT,
-    country TEXT,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  );
-`);
-
-try {
-  database.exec("ALTER TABLE links ADD COLUMN bio TEXT;");
-} catch (e) {
-  // column might already exist
+function escapeHtml(text: string): string {
+  return text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
 }
 
 const UPLOADS_DIR = path.join(process.cwd(), "uploads");
@@ -37,19 +30,26 @@ if (!fs.existsSync(UPLOADS_DIR)) {
   fs.mkdirSync(UPLOADS_DIR, { recursive: true });
 }
 
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    cb(null, UPLOADS_DIR);
-  },
-  filename: (req, file, cb) => {
-    const uniqueSuffix = Date.now() + "-" + Math.round(Math.random() * 1e9);
-    const ext = path.extname(file.originalname);
-    cb(null, file.fieldname + "-" + uniqueSuffix + ext);
-  },
+const useRemoteDb = isRemoteDatabase();
+
+const upload = multer({
+  storage: useRemoteDb
+    ? multer.memoryStorage()
+    : multer.diskStorage({
+        destination: (_req, _file, cb) => cb(null, UPLOADS_DIR),
+        filename: (_req, file, cb) => {
+          const uniqueSuffix = Date.now() + "-" + Math.round(Math.random() * 1e9);
+          const ext = path.extname(file.originalname);
+          cb(null, file.fieldname + "-" + uniqueSuffix + ext);
+        },
+      }),
+  limits: { fileSize: 5 * 1024 * 1024 },
 });
-const upload = multer({ storage });
 
 export async function startServer() {
+  const db = createDbClient();
+  await runMigrations(db);
+
   const app = express();
   const PORT = 3000;
 
@@ -69,26 +69,45 @@ export async function startServer() {
   app.use(express.json());
   app.use("/uploads", express.static(UPLOADS_DIR));
 
-  // --- API Routes ---
-  app.post("/api/links", upload.single("screenshot"), (req, res) => {
+  app.post("/api/links", upload.single("screenshot"), async (req, res) => {
     try {
       const { slug, bio } = req.body;
-      const screenshot_path = req.file ? `uploads/${req.file.filename}` : null;
-
       if (!slug) {
         return res.status(400).json({ error: "Slug is required" });
       }
 
+      let screenshot_path: string | null = null;
+      let screenshot_mime: string | null = null;
+      let screenshot_base64: string | null = null;
+
+      if (req.file) {
+        if (useRemoteDb) {
+          screenshot_mime = req.file.mimetype || "application/octet-stream";
+          screenshot_base64 = req.file.buffer.toString("base64");
+        } else {
+          screenshot_path = `uploads/${req.file.filename}`;
+        }
+      }
+
       const id = crypto.randomUUID();
+      await insertLink(db, {
+        id,
+        slug,
+        bio: bio || "",
+        screenshot_path,
+        screenshot_mime,
+        screenshot_base64,
+      });
 
-      const stmt = database.prepare(
-        "INSERT INTO links (id, slug, bio, screenshot_path) VALUES (?, ?, ?, ?)"
-      );
-      stmt.run(id, slug, bio || "", screenshot_path || "");
-
-      res.status(201).json({ id, slug, bio, screenshot_path });
-    } catch (err: any) {
-      if (err.message.includes("UNIQUE constraint failed")) {
+      res.status(201).json({
+        id,
+        slug,
+        bio: bio || "",
+        screenshot_path,
+        screenshot_inline: !!screenshot_base64,
+      });
+    } catch (err: unknown) {
+      if (isUniqueConstraintError(err)) {
         return res.status(400).json({ error: "Slug already exists" });
       }
       console.error(err);
@@ -96,44 +115,47 @@ export async function startServer() {
     }
   });
 
-  app.get("/api/links", (req, res) => {
+  app.get("/api/links", async (_req, res) => {
     try {
-      const stmt = database.prepare(`
-        SELECT
-          l.id, l.slug, l.bio, l.screenshot_path, l.created_at,
-          COUNT(v.id) as total_clicks,
-          COUNT(DISTINCT v.ip_address) as unique_clicks
-        FROM links l
-        LEFT JOIN visits v ON l.slug = v.link_slug
-        GROUP BY l.id
-        ORDER BY l.created_at DESC
-      `);
-      const links = stmt.all();
-
-      // For each link, fetch country breakdown
-      for (let link of links as any[]) {
-        const countryStmt = database.prepare(`
-          SELECT country, COUNT(*) as count
-          FROM visits
-          WHERE link_slug = ?
-          GROUP BY country
-          ORDER BY count DESC
-        `);
-        link.countries = countryStmt.all(link.slug);
-      }
-
-      res.json(links);
+      const links = await listLinksWithAnalytics(db);
+      res.json(
+        links.map((l) => ({
+          id: l.id,
+          slug: l.slug,
+          bio: l.bio ?? "",
+          screenshot_path: l.screenshot_path,
+          screenshot_inline: !!l.screenshot_base64,
+          created_at: l.created_at,
+          total_clicks: l.total_clicks,
+          unique_clicks: l.unique_clicks,
+          countries: l.countries,
+        })),
+      );
     } catch (error) {
-       console.error(error);
-       res.status(500).json({ error: "Internal server error" });
+      console.error(error);
+      res.status(500).json({ error: "Internal server error" });
     }
   });
 
-  // Dynamic Slug Route (resolves /example)
-  app.get("/:slug", (req, res, next) => {
+  app.get("/api/links/:slug/screenshot", async (req, res) => {
+    try {
+      const link = await getLinkBySlug(db, req.params.slug);
+      if (!link?.screenshot_base64 || !link.screenshot_mime) {
+        return res.status(404).end();
+      }
+      const buf = Buffer.from(link.screenshot_base64, "base64");
+      res.setHeader("Content-Type", link.screenshot_mime);
+      res.setHeader("Cache-Control", "public, max-age=86400");
+      res.send(buf);
+    } catch (e) {
+      console.error(e);
+      res.status(500).end();
+    }
+  });
+
+  app.get("/:slug", async (req, res, next) => {
     const slug = req.params.slug;
 
-    // Skip known reserved paths used by Vite / backend
     if (
       slug.startsWith("api") ||
       slug.startsWith("uploads") ||
@@ -145,8 +167,7 @@ export async function startServer() {
     }
 
     try {
-      const stmt = database.prepare("SELECT * FROM links WHERE slug = ?");
-      const link = stmt.get(slug) as any;
+      const link = await getLinkBySlug(db, slug);
 
       if (link) {
         let ip = req.headers["x-forwarded-for"] || req.socket.remoteAddress || "127.0.0.1";
@@ -156,41 +177,40 @@ export async function startServer() {
         const geo = geoip.lookup(ip);
         const country = geo ? geo.country : "Unknown";
 
-        const insertStmt = database.prepare(
-          "INSERT INTO visits (link_slug, ip_address, country) VALUES (?, ?, ?)"
-        );
-        insertStmt.run(slug, ip, country);
+        await insertVisit(db, slug, ip, country);
 
-        res.send(`
-          <!DOCTYPE html>
-          <html>
-          <head>
-            <title>View Link</title>
-            <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <style>
-              body { font-family: system-ui, sans-serif; background: #f4f4f5; display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 100vh; margin: 0; padding: 20px; box-sizing: border-box; }
-              .card { background: white; padding: 24px; border-radius: 12px; box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.1); max-width: 800px; width: 100%; text-align: center; }
-              img { max-width: 100%; height: auto; border-radius: 8px; margin-top: 16px; margin-bottom: 24px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
-              a.btn { display: inline-block; background: #18181b; color: #fff; padding: 12px 24px; text-decoration: none; border-radius: 8px; font-weight: 500; font-size: 16px; transition: background 0.2s; }
-              a.btn:hover { background: #27272a; }
-            </style>
-          </head>
-          <body>
-            <div class="card">
-              ${
-                link.bio 
-                 ? `<p style="font-size: 1.1rem; color: #3f3f46; margin-bottom: 24px;">${link.bio}</p>` 
-                 : ""
-              }
-              ${
-                link.screenshot_path
-                  ? `<img src="/${link.screenshot_path}" alt="Screenshot for ${link.slug}" />`
-                  : "<p>No screenshot available.</p>"
-              }
-            </div>
-          </body>
-          </html>
-        `);
+        const imgSrc = link.screenshot_base64
+          ? `/api/links/${encodeURIComponent(link.slug)}/screenshot`
+          : link.screenshot_path
+            ? `/${link.screenshot_path}`
+            : null;
+
+        const bioHtml = link.bio
+          ? `<p style="font-size: 1.1rem; color: #3f3f46; margin-bottom: 24px;">${escapeHtml(link.bio)}</p>`
+          : "";
+
+        const imgHtml = imgSrc
+          ? `<img src="${imgSrc}" alt="Screenshot for ${escapeHtml(link.slug)}" />`
+          : "<p>No screenshot available.</p>";
+
+        res.send(`<!DOCTYPE html>
+<html>
+<head>
+  <title>View Link</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <style>
+    body { font-family: system-ui, sans-serif; background: #f4f4f5; display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 100vh; margin: 0; padding: 20px; box-sizing: border-box; }
+    .card { background: white; padding: 24px; border-radius: 12px; box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.1); max-width: 800px; width: 100%; text-align: center; }
+    img { max-width: 100%; height: auto; border-radius: 8px; margin-top: 16px; margin-bottom: 24px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+  </style>
+</head>
+<body>
+  <div class="card">
+    ${bioHtml}
+    ${imgHtml}
+  </div>
+</body>
+</html>`);
       } else {
         next();
       }
@@ -200,7 +220,6 @@ export async function startServer() {
     }
   });
 
-  // Vite middleware for development
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
       server: { middlewareMode: true },
@@ -217,6 +236,11 @@ export async function startServer() {
 
   app.listen(PORT, "0.0.0.0", () => {
     console.log(`Server running on http://localhost:${PORT}`);
+    console.log(
+      useRemoteDb
+        ? "Database: Turso (remote)"
+        : "Database: local links.db file",
+    );
   });
 }
 
