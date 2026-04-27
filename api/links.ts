@@ -23,7 +23,7 @@ function sendError(
 ) {
   const e = err as { statusCode?: number; message?: string };
   const status = typeof e.statusCode === "number" ? e.statusCode : 500;
-  const msg = status === 500 ? fallback : e.message || fallback;
+  const msg = (e.message && e.message.trim()) || fallback;
   res.status(status).json({ error: msg });
 }
 
@@ -35,9 +35,20 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     return;
   }
 
+  let supabase: ReturnType<typeof getSupabaseServer>;
   try {
-    const supabase = getSupabaseServer();
+    supabase = getSupabaseServer();
+  } catch (configErr) {
+    console.error(configErr);
+    const hint =
+      "Add SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY under Vercel → Project → Settings → Environment Variables. Enable them for Preview (and Production), then redeploy.";
+    res.status(503).json({
+      error: `Supabase is not configured on this deployment. ${hint}`,
+    });
+    return;
+  }
 
+  try {
     if (req.method === "GET") {
       const payload = await buildLinksPayload(supabase);
       res.status(200).json(payload);
@@ -83,6 +94,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     res.status(405).json({ error: "Method not allowed" });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: "Internal server error" });
+    const msg = err instanceof Error && err.message ? err.message : "Internal server error";
+    res.status(500).json({ error: msg });
   }
 }

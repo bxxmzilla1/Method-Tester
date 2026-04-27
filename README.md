@@ -38,6 +38,12 @@ Vercel runs `npm run build`, serves the `dist` static assets, and runs serverles
 | `SUPABASE_SERVICE_ROLE_KEY` | **Server only** — never use `VITE_*` for this |
 | `CORS_ORIGIN` | Optional — only if the UI is on another origin (e.g. `https://your-app.vercel.app`) |
 
+Use the **service_role** key from Supabase (Settings → API), not the anon key — otherwise inserts and Storage uploads fail with permission errors.
+
+For **preview** URLs (`*.vercel.app` with a git branch hash), add the same variables under **Preview** in Environment Variables, not only Production, then redeploy.
+
+If **`manifest.webmanifest` returns 401**, Vercel **Deployment Protection** on preview deployments is often the cause (the PWA manifest fetch does not pass your login). Use an unprotected production URL for install tests, or adjust protection in the Vercel project settings.
+
 The UI calls `/api` on the same deployment when `VITE_API_BASE_URL` is unset. For a **local** dev server, use `npm run dev` ([server.ts](server.ts)). Vercel’s request body size limit may be lower than 5 MB depending on plan; shrink screenshots if uploads fail.
 
 Add any `VITE_*` variables needed for the frontend; they are inlined at build time.

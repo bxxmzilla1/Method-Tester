@@ -130,9 +130,12 @@ export async function createLink(
 
     if (upErr) {
       console.error(upErr);
-      throw Object.assign(new Error("Failed to upload screenshot"), {
-        statusCode: 500,
-      });
+      throw Object.assign(
+        new Error(
+          upErr.message || "Failed to upload screenshot — check Storage bucket `link-screenshots` exists (run supabase/migrations/001_initial.sql).",
+        ),
+        { statusCode: 500 },
+      );
     }
 
     const { data: pub } = supabase.storage
@@ -159,7 +162,13 @@ export async function createLink(
       });
     }
     console.error(error);
-    throw Object.assign(new Error("Internal server error"), { statusCode: 500 });
+    throw Object.assign(
+      new Error(
+        error.message ||
+          "Database error — confirm you use the Supabase service_role key (not the anon key) and migrations are applied.",
+      ),
+      { statusCode: 500 },
+    );
   }
 
   return data;
